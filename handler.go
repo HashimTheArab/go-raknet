@@ -11,7 +11,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/sandertv/go-raknet/internal/message"
 )
 
@@ -175,8 +174,8 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 	data := map[string]any{
 		"raddr": conn.raddr.String(),
 		"name":  name,
-		"id": b[0],
-		"data": b[1:],
+		"id":    b[0],
+		"data":  b[1:],
 	}
 
 	f, err := os.OpenFile("packets.json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
