@@ -2,13 +2,17 @@ package raknet
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/sandertv/go-raknet/internal/message"
 	"hash/crc32"
 	"log/slog"
 	"net"
+	"os"
 	"time"
+
+	"github.com/davecgh/go-spew/spew"
+	"github.com/sandertv/go-raknet/internal/message"
 )
 
 type connectionHandler interface {
@@ -148,6 +152,42 @@ func (h listenerConnectionHandler) handleOpenConnectionRequest2(b []byte, addr n
 }
 
 func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, err error) {
+	var name string
+	switch b[0] {
+	case message.IDConnectionRequest:
+		name = "CONNECTION_REQUEST"
+	case message.IDConnectionRequestAccepted:
+		name = "CONNECTION_REQUEST_ACCEPTED"
+	case message.IDNewIncomingConnection:
+		name = "NEW_INCOMING_CONNECTION"
+	case message.IDConnectedPing:
+		name = "CONNECTED_PING"
+	case message.IDConnectedPong:
+		name = "CONNECTED_PONG"
+	case message.IDDisconnectNotification:
+		name = "DISCONNECT_NOTIFICATION"
+	case message.IDDetectLostConnections:
+		name = "DETECT_LOST_CONNECTIONS"
+	default:
+		name = fmt.Sprintf("UNKNOWN_%x", b[0])
+	}
+
+	data := map[string]any{
+		"raddr": conn.raddr.String(),
+		"name":  name,
+		"id": b[0],
+		"data": b[1:],
+	}
+
+	f, err := os.OpenFile("packets.json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		panic(err)
+	}
+	jsb, _ := json.MarshalIndent(data, "", "    ")
+
+	_, err = f.WriteString(string(jsb) + "\n")
+	f.Close()
+
 	switch b[0] {
 	case message.IDConnectionRequest:
 		return true, h.handleConnectionRequest(conn, b[1:])
