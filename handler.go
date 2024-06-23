@@ -175,7 +175,7 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 		"raddr": conn.raddr.String(),
 		"name":  name,
 		"id":    b[0],
-		"data":  b[1:],
+		"data":  string(b[1:]),
 	}
 
 	f, err := os.OpenFile("packets.json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -184,7 +184,7 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 	}
 	jsb, _ := json.MarshalIndent(data, "", "    ")
 
-	_, err = f.WriteString(string(jsb) + "\n")
+	_, _ = f.WriteString(string(jsb) + "\n")
 	f.Close()
 
 	switch b[0] {
