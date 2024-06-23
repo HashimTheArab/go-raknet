@@ -187,6 +187,8 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 	_, _ = f.WriteString(string(jsb) + "\n")
 	f.Close()
 
+	fmt.Println(name, string(b[1:]))
+
 	switch b[0] {
 	case message.IDConnectionRequest:
 		return true, h.handleConnectionRequest(conn, b[1:])
