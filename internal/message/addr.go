@@ -18,10 +18,10 @@ func (addresses systemAddresses) sizeOf() int {
 
 // sizeOfAddr returns the size in bytes of an address.
 func sizeofAddr(addr netip.AddrPort) int {
-	if addr.Addr().Is6() {
-		return sizeofAddr6
+	if addr.Addr().Is4() {
+		return sizeofAddr4
 	}
-	return sizeofAddr4
+	return sizeofAddr6
 }
 
 const (
