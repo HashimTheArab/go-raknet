@@ -174,19 +174,19 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 		"raddr": conn.raddr.String(),
 		"name":  name,
 		"id":    b[0],
-		"data":  "",
+		"data":  []byte{},
 	}
 
 	if name != "" {
 		if name != "CONNECETED_PING" && name != "CONNECTED_PONG" {
-			data["data"] = string(b[1:])
+			data["data"] = b[1:]
 		}
 
 		f, err := os.OpenFile("packets.json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			panic(err)
 		}
-		_, _ = f.WriteString(fmt.Sprintf("%v %v\n%v\n", data["id"], data["name"], data["data"]))
+		_, _ = f.WriteString(fmt.Sprintf("%v %v\n%x\n", data["id"], data["name"], data["data"]))
 		f.Close()
 	}
 
