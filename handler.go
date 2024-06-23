@@ -2,7 +2,6 @@ package raknet
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -168,26 +167,28 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 	case message.IDDetectLostConnections:
 		name = "DETECT_LOST_CONNECTIONS"
 	default:
-		name = fmt.Sprintf("UNKNOWN_%x", b[0])
+		name = ""
 	}
 
 	data := map[string]any{
 		"raddr": conn.raddr.String(),
 		"name":  name,
 		"id":    b[0],
-		"data":  string(b[1:]),
+		"data":  "",
 	}
 
-	f, err := os.OpenFile("packets.json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		panic(err)
+	if name != "" {
+		if name != "CONNECETED_PING" && name != "CONNECTED_PONG" {
+			data["data"] = string(b[1:])
+		}
+
+		f, err := os.OpenFile("packets.json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			panic(err)
+		}
+		_, _ = f.WriteString(fmt.Sprintf("%v %v\n%v\n", data["id"], data["name"], data["data"]))
+		f.Close()
 	}
-	jsb, _ := json.MarshalIndent(data, "", "    ")
-
-	_, _ = f.WriteString(string(jsb) + "\n")
-	f.Close()
-
-	fmt.Println(name, string(b[1:]))
 
 	switch b[0] {
 	case message.IDConnectionRequest:
@@ -195,6 +196,7 @@ func (h listenerConnectionHandler) handle(conn *Conn, b []byte) (handled bool, e
 	case message.IDConnectionRequestAccepted:
 		return true, errUnexpectedCRA
 	case message.IDNewIncomingConnection:
+		fmt.Println("new incoming conn")
 		return true, h.handleNewIncomingConnection(conn)
 	case message.IDConnectedPing:
 		return true, handleConnectedPing(conn, b[1:])
