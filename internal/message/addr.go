@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/netip"
-	"syscall"
 )
 
 type systemAddresses [20]netip.AddrPort
