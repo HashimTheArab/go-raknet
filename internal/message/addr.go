@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/netip"
+	"syscall"
 )
 
 type systemAddresses [20]netip.AddrPort
@@ -49,14 +50,15 @@ func putAddr(b []byte, addrPort netip.AddrPort) int {
 		binary.BigEndian.PutUint16(b[5:], port)
 		return sizeofAddr4
 	} else {
-		fmt.Println("using v6")
 		ip16 := addr.As16()
 		b[0] = 6
-		binary.BigEndian.PutUint16(b[1:], uint16(23)) // syscall.AF_INET6 on Windows.
+		// 2 bytes.
+		binary.LittleEndian.PutUint16(b[1:], uint16(10)) // syscall.AF_INET6 on Windows.
 		binary.BigEndian.PutUint16(b[3:], port)
 		// 4 bytes.
 		copy(b[9:], ip16[:])
 		// 4 bytes.
+		fmt.Println("using v6", b)
 		return sizeofAddr6
 	}
 }
