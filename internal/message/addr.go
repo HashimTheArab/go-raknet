@@ -50,7 +50,6 @@ func putAddr(b []byte, addrPort netip.AddrPort) int {
 		binary.BigEndian.PutUint16(b[5:], port)
 		return sizeofAddr4
 	} else {
-		addr.Zone()
 		ip16 := addr.As16()
 		b[0] = 6
 		// 2 bytes.
@@ -68,7 +67,7 @@ func putAddr(b []byte, addrPort netip.AddrPort) int {
 func addr(b []byte) (netip.AddrPort, int) {
 	if b[0] == 4 || b[0] == 0 {
 		ip := netip.AddrFrom4([4]byte{(-b[1] - 1) & 0xff, (-b[2] - 1) & 0xff, (-b[3] - 1) & 0xff, (-b[4] - 1) & 0xff})
-		port := binary.BigEndian.Uixnt16(b[5:])
+		port := binary.BigEndian.Uint16(b[5:])
 		return netip.AddrPortFrom(ip, port), sizeofAddr4
 	} else {
 		port := binary.BigEndian.Uint16(b[3:])
