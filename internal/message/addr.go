@@ -2,8 +2,8 @@ package message
 
 import (
 	"encoding/binary"
-	"fmt"
 	"net/netip"
+	"syscall"
 )
 
 type systemAddresses [20]netip.AddrPort
@@ -20,9 +20,6 @@ func (addresses systemAddresses) sizeOf() int {
 // sizeOfAddr returns the size in bytes of an address.
 func sizeofAddr(addr netip.AddrPort) int {
 	if addr.Addr().Is6() {
-		if addr.Addr().Is4() {
-			fmt.Println("addr is 4 and 6")
-		}
 		return sizeofAddr6
 	}
 	return sizeofAddr4
@@ -36,12 +33,12 @@ const (
 func putAddr(b []byte, addrPort netip.AddrPort) int {
 	addr, port := addrPort.Addr(), addrPort.Port()
 	if !addr.Is4() && !addr.Is6() {
-		fmt.Println("no v4 or v6")
+		// fmt.Println("no v4 or v6")
 		// Special case for zero addresses.
 		b[0], b[1], b[2], b[3], b[4] = 4, 255, 255, 255, 255
 		return sizeofAddr4
 	} else if addr.Is4() {
-		fmt.Println("using v4")
+		// fmt.Println("using v4")
 		ip4 := addr.As4()
 		// b[0] = 4
 		// copy(b[1:], ip4[:])
@@ -52,12 +49,12 @@ func putAddr(b []byte, addrPort netip.AddrPort) int {
 		ip16 := addr.As16()
 		b[0] = 6
 		// 2 bytes.
-		binary.LittleEndian.PutUint16(b[1:], uint16(10)) // syscall.AF_INET6 on Windows.
+		binary.LittleEndian.PutUint16(b[1:], uint16(syscall.AF_INET6))
 		binary.BigEndian.PutUint16(b[3:], port)
 		// 4 bytes.
 		copy(b[9:], ip16[:])
 		// 4 bytes.
-		fmt.Println("using v6", b)
+		// fmt.Println("using v6", b)
 		return sizeofAddr6
 	}
 }
