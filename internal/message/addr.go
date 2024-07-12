@@ -49,7 +49,7 @@ func putAddr(b []byte, addrPort netip.AddrPort) int {
 		ip16 := addr.As16()
 		b[0] = 6
 		// 2 bytes.
-		binary.LittleEndian.PutUint16(b[1:], uint16(syscall.AF_INET6))
+		binary.BigEndian.PutUint16(b[1:], uint16(syscall.AF_INET6))
 		binary.BigEndian.PutUint16(b[3:], port)
 		// 4 bytes.
 		copy(b[9:], ip16[:])
