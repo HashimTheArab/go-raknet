@@ -260,8 +260,16 @@ func (conn *Conn) startTicking() {
 				conn.mu.Unlock()
 
 				since := t.Sub(time.Unix(unix, 0))
-				if acksLeft == 0 || since > time.Second*5 {
+				if since > time.Second*5 {
 					conn.closeImmediately()
+				} else if acksLeft == 0 {
+					if conn.disconnectSent.Load() {
+						conn.closeImmediately()
+					} else {
+						// Keep ticking so the final notification is retransmitted
+						// until acknowledged, just like the application data.
+						_ = conn.sendDisconnect()
+					}
 				}
 				continue
 			}
