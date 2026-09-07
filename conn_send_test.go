@@ -354,3 +354,33 @@ func TestCloseImmediatelyFlushesDisconnect(t *testing.T) {
 		}
 	}
 }
+
+// Graceful close must leave the transport open for the final application
+// message. closeImmediately sends the notification after the queue drains.
+func TestCloseDefersNotificationUntilFinalApplicationDataDrains(t *testing.T) {
+	conn, socket, cancel := newSendTestConn()
+	defer cancel()
+	payload := []byte("final disconnect message")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(conn.controlQueue) != 0 {
+		t.Fatal("Close queued a transport notification before application data drained")
+	}
+	conn.mu.Lock()
+	err := conn.drainSendQueue()
+	conn.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(socket.writes) != 1 || !bytes.Contains(socket.writes[0], payload) {
+		t.Fatal("final application message was not sent first")
+	}
+	conn.closeImmediately()
+	if len(socket.writes) != 2 || !bytes.Contains(socket.writes[1], []byte{message.IDDisconnectNotification}) {
+		t.Fatal("terminal close did not send transport notification")
+	}
+}

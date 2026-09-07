@@ -258,7 +258,7 @@ func (conn *Conn) startTicking() {
 			if unix := conn.closing.Load(); unix != 0 {
 				before := acksLeft
 				conn.mu.Lock()
-				acksLeft = len(conn.retransmission.unacknowledged)
+				acksLeft = len(conn.retransmission.unacknowledged) + len(conn.sendQueue) + len(conn.controlQueue)
 				conn.mu.Unlock()
 
 				if before != 0 && acksLeft == 0 {
@@ -508,10 +508,9 @@ func (conn *Conn) ReadPacket() (b []byte, err error) {
 // cancelled and will return an error, as soon as the closing of the connection
 // is acknowledged by the client.
 func (conn *Conn) Close() error {
-	if !conn.closing.CompareAndSwap(0, time.Now().Unix()) {
-		return nil
-	}
-	_ = conn.sendDisconnect()
+	// Let queued application packets reach the peer before sending the transport
+	// notification. Bedrock otherwise discards its final disconnect message.
+	conn.closing.CompareAndSwap(0, time.Now().Unix())
 	return nil
 }
 
