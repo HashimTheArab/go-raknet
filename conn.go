@@ -240,7 +240,6 @@ func (conn *Conn) startTicking() {
 		interval = time.Second / 10
 		ticker   = time.NewTicker(interval)
 		i        int64
-		acksLeft int
 	)
 	defer ticker.Stop()
 	for {
@@ -256,17 +255,21 @@ func (conn *Conn) startTicking() {
 			conn.flushACKs()
 			conn.update(t)
 			if unix := conn.closing.Load(); unix != 0 {
-				before := acksLeft
 				conn.mu.Lock()
-				acksLeft = len(conn.retransmission.unacknowledged)
+				acksLeft := len(conn.retransmission.unacknowledged) + len(conn.sendQueue) + len(conn.controlQueue)
 				conn.mu.Unlock()
 
-				if before != 0 && acksLeft == 0 {
-					conn.closeImmediately()
-				}
 				since := t.Sub(time.Unix(unix, 0))
-				if (acksLeft == 0 && since > time.Second) || since > time.Second*5 {
+				if since > time.Second*5 {
 					conn.closeImmediately()
+				} else if acksLeft == 0 {
+					if conn.disconnectSent.Load() {
+						conn.closeImmediately()
+					} else {
+						// Keep ticking so the final notification is retransmitted
+						// until acknowledged, just like the application data.
+						_ = conn.sendDisconnect()
+					}
 				}
 				continue
 			}
@@ -508,10 +511,9 @@ func (conn *Conn) ReadPacket() (b []byte, err error) {
 // cancelled and will return an error, as soon as the closing of the connection
 // is acknowledged by the client.
 func (conn *Conn) Close() error {
-	if !conn.closing.CompareAndSwap(0, time.Now().Unix()) {
-		return nil
-	}
-	_ = conn.sendDisconnect()
+	// Let queued application packets reach the peer before sending the transport
+	// notification. Bedrock otherwise discards its final disconnect message.
+	conn.closing.CompareAndSwap(0, time.Now().Unix())
 	return nil
 }
 

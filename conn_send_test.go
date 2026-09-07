@@ -354,3 +354,205 @@ func TestCloseImmediatelyFlushesDisconnect(t *testing.T) {
 		}
 	}
 }
+
+// The ticker must close an empty connection without waiting for the timeout,
+// and keep queued or unacknowledged work alive until it drains.
+func TestCloseThroughTicker(t *testing.T) {
+	for _, queues := range []struct {
+		name                 string
+		application, control bool
+	}{
+		{name: "empty"},
+		{name: "application", application: true},
+		{name: "control", control: true},
+		{name: "both", application: true, control: true},
+	} {
+		t.Run(queues.name, func(t *testing.T) {
+			conn, socket, cancel := newSendTestConn()
+			if queues.application || queues.control {
+				conn.congestion.window = 0
+			}
+			payloads := [][]byte{}
+			for _, work := range []struct {
+				enabled, control bool
+				payload          string
+			}{
+				{queues.application, false, "final application message"},
+				{queues.control, true, "pending control message"},
+			} {
+				if work.enabled {
+					payload := []byte(work.payload)
+					if _, err := conn.write(payload, reliabilityReliableOrdered, work.control); err != nil {
+						t.Fatal(err)
+					}
+					payloads = append(payloads, payload)
+				}
+			}
+			if err := conn.Close(); err != nil {
+				t.Fatal(err)
+			}
+			// Keep the old whole-second timeout out of the assertion window,
+			// independent of where the test starts within a wall-clock second.
+			conn.closing.Store(time.Now().Add(time.Second).Unix())
+			done := make(chan struct{})
+			go func() { defer close(done); conn.startTicking() }()
+			defer func() { cancel(); <-done }()
+
+			if len(payloads) != 0 {
+				select {
+				case <-conn.ctx.Done():
+					t.Fatal("closed with queued work")
+				case <-time.After(250 * time.Millisecond):
+				}
+				socket.mu.Lock()
+				writes := len(socket.writes)
+				socket.mu.Unlock()
+				if writes != 0 {
+					t.Fatal("sent with closed transmission window")
+				}
+				conn.mu.Lock()
+				conn.congestion.window = float64(conn.effectiveMTU())
+				conn.mu.Unlock()
+				conn.signalSend()
+				deadline := time.Now().Add(time.Second)
+				for {
+					conn.mu.Lock()
+					drained := len(conn.sendQueue) == 0 && len(conn.controlQueue) == 0
+					conn.mu.Unlock()
+					if drained {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("queues did not drain")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				select {
+				case <-conn.ctx.Done():
+					t.Fatal("closed before application/control ACKs")
+				case <-time.After(150 * time.Millisecond):
+				}
+				conn.mu.Lock()
+				var sequences []uint24
+				for seq := range conn.retransmission.unacknowledged {
+					sequences = append(sequences, seq)
+				}
+				conn.mu.Unlock()
+				ack := bytes.NewBuffer(nil)
+				(&acknowledgement{packets: sequences}).write(ack, conn.effectiveMTU())
+				if err := conn.handleACK(ack.Bytes()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			waitForCloseDatagrams(t, socket, len(payloads)+1)
+			select {
+			case <-conn.ctx.Done():
+				t.Fatal("closed before disconnect notification ACK")
+			default:
+			}
+			ackCloseDatagram(t, conn, socket, len(payloads))
+			select {
+			case <-done:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("empty connection did not close promptly")
+			}
+			socket.mu.Lock()
+			defer socket.mu.Unlock()
+			if len(socket.writes) != len(payloads)+1 {
+				t.Fatalf("got %d datagrams, want %d", len(socket.writes), len(payloads)+1)
+			}
+			for _, payload := range payloads {
+				found := false
+				for _, datagram := range socket.writes[:len(payloads)] {
+					found = found || bytes.Contains(datagram, payload)
+				}
+				if !found {
+					t.Fatalf("payload %q missing before notification", payload)
+				}
+			}
+			if !bytes.Contains(socket.writes[len(payloads)], []byte{message.IDDisconnectNotification}) {
+				t.Fatal("last datagram is not disconnect notification")
+			}
+		})
+	}
+}
+
+func waitForCloseDatagrams(t *testing.T, socket *recordingPacketConn, count int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		socket.mu.Lock()
+		got := len(socket.writes)
+		socket.mu.Unlock()
+		if got >= count {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("got %d datagrams, want at least %d", got, count)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func ackCloseDatagram(t *testing.T, conn *Conn, socket *recordingPacketConn, index int) {
+	t.Helper()
+	socket.mu.Lock()
+	seq := loadUint24(socket.writes[index][1:])
+	socket.mu.Unlock()
+	ack := bytes.NewBuffer(nil)
+	(&acknowledgement{packets: []uint24{seq}}).write(ack, conn.effectiveMTU())
+	if err := conn.handleACK(ack.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCloseRetransmitsLostNotification(t *testing.T) {
+	conn, socket, cancel := newSendTestConn()
+	conn.retransmission.hasRTT = true
+	conn.retransmission.estimatedRTT = 50 * time.Millisecond
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); conn.startTicking() }()
+	defer func() { cancel(); <-done }()
+	// Drop the first notification by withholding its ACK. The actual send
+	// loop must retry it and remain open until the retry is acknowledged.
+	waitForCloseDatagrams(t, socket, 2)
+	select {
+	case <-conn.ctx.Done():
+		t.Fatal("closed before retry was acknowledged")
+	default:
+	}
+	socket.mu.Lock()
+	for _, b := range socket.writes {
+		if !bytes.Contains(b, []byte{message.IDDisconnectNotification}) {
+			t.Error("expected disconnect notification")
+		}
+	}
+	socket.mu.Unlock()
+	ackCloseDatagram(t, conn, socket, 1)
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("did not close after notification ACK")
+	}
+}
+
+func TestCloseNotificationACKTimeout(t *testing.T) {
+	conn, socket, cancel := newSendTestConn()
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); conn.startTicking() }()
+	defer func() { cancel(); <-done }()
+	waitForCloseDatagrams(t, socket, 1)
+	// A peer that never acknowledges must not keep the transport alive forever.
+	conn.closing.Store(time.Now().Add(-6 * time.Second).Unix())
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("notification ACK timeout did not close the connection")
+	}
+}
