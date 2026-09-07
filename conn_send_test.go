@@ -355,32 +355,115 @@ func TestCloseImmediatelyFlushesDisconnect(t *testing.T) {
 	}
 }
 
-// Graceful close must leave the transport open for the final application
-// message. closeImmediately sends the notification after the queue drains.
-func TestCloseDefersNotificationUntilFinalApplicationDataDrains(t *testing.T) {
-	conn, socket, cancel := newSendTestConn()
-	defer cancel()
-	payload := []byte("final disconnect message")
-	if _, err := conn.Write(payload); err != nil {
-		t.Fatal(err)
-	}
-	if err := conn.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if len(conn.controlQueue) != 0 {
-		t.Fatal("Close queued a transport notification before application data drained")
-	}
-	conn.mu.Lock()
-	err := conn.drainSendQueue()
-	conn.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(socket.writes) != 1 || !bytes.Contains(socket.writes[0], payload) {
-		t.Fatal("final application message was not sent first")
-	}
-	conn.closeImmediately()
-	if len(socket.writes) != 2 || !bytes.Contains(socket.writes[1], []byte{message.IDDisconnectNotification}) {
-		t.Fatal("terminal close did not send transport notification")
+// The ticker must close an empty connection without waiting for the timeout,
+// and keep queued or unacknowledged work alive until it drains.
+func TestCloseThroughTicker(t *testing.T) {
+	for _, queues := range []struct {
+		name                 string
+		application, control bool
+	}{
+		{name: "empty"},
+		{name: "application", application: true},
+		{name: "control", control: true},
+		{name: "both", application: true, control: true},
+	} {
+		t.Run(queues.name, func(t *testing.T) {
+			conn, socket, cancel := newSendTestConn()
+			conn.congestion.window = 0
+			payloads := [][]byte{}
+			for _, work := range []struct {
+				enabled, control bool
+				payload          string
+			}{
+				{queues.application, false, "final application message"},
+				{queues.control, true, "pending control message"},
+			} {
+				if work.enabled {
+					payload := []byte(work.payload)
+					if _, err := conn.write(payload, reliabilityReliableOrdered, work.control); err != nil {
+						t.Fatal(err)
+					}
+					payloads = append(payloads, payload)
+				}
+			}
+			if err := conn.Close(); err != nil {
+				t.Fatal(err)
+			}
+			// Keep the old whole-second timeout out of the assertion window,
+			// independent of where the test starts within a wall-clock second.
+			conn.closing.Store(time.Now().Add(time.Second).Unix())
+			done := make(chan struct{})
+			go func() { defer close(done); conn.startTicking() }()
+			defer func() { cancel(); <-done }()
+
+			if len(payloads) != 0 {
+				select {
+				case <-conn.ctx.Done():
+					t.Fatal("closed with queued work")
+				case <-time.After(250 * time.Millisecond):
+				}
+				socket.mu.Lock()
+				writes := len(socket.writes)
+				socket.mu.Unlock()
+				if writes != 0 {
+					t.Fatal("sent with closed transmission window")
+				}
+				conn.mu.Lock()
+				conn.congestion.window = float64(conn.effectiveMTU())
+				conn.mu.Unlock()
+				conn.signalSend()
+				deadline := time.Now().Add(time.Second)
+				for {
+					conn.mu.Lock()
+					drained := len(conn.sendQueue) == 0 && len(conn.controlQueue) == 0
+					conn.mu.Unlock()
+					if drained {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("queues did not drain")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				select {
+				case <-conn.ctx.Done():
+					t.Fatal("closed before application/control ACKs")
+				case <-time.After(150 * time.Millisecond):
+				}
+				conn.mu.Lock()
+				var sequences []uint24
+				for seq := range conn.retransmission.unacknowledged {
+					sequences = append(sequences, seq)
+				}
+				conn.mu.Unlock()
+				ack := bytes.NewBuffer(nil)
+				(&acknowledgement{packets: sequences}).write(ack, conn.effectiveMTU())
+				if err := conn.handleACK(ack.Bytes()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			select {
+			case <-done:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("empty connection did not close promptly")
+			}
+			socket.mu.Lock()
+			defer socket.mu.Unlock()
+			if len(socket.writes) != len(payloads)+1 {
+				t.Fatalf("got %d datagrams, want %d", len(socket.writes), len(payloads)+1)
+			}
+			for _, payload := range payloads {
+				found := false
+				for _, datagram := range socket.writes[:len(payloads)] {
+					found = found || bytes.Contains(datagram, payload)
+				}
+				if !found {
+					t.Fatalf("payload %q missing before notification", payload)
+				}
+			}
+			if !bytes.Contains(socket.writes[len(payloads)], []byte{message.IDDisconnectNotification}) {
+				t.Fatal("last datagram is not disconnect notification")
+			}
+		})
 	}
 }
