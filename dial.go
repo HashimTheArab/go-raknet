@@ -329,8 +329,7 @@ type connState struct {
 	raddr net.Addr
 	id    int64
 
-	// mtu is the final MTU size found by sending an open connection request
-	// 1 packet. It is the MTU size sent by the server.
+	// mtu is advertised by Reply 1 and finalized by Reply 2.
 	mtu uint16
 
 	// maxMTU is copied from Dialer.MaxMTU and caps the probe sizes used
@@ -353,17 +352,6 @@ const minSupportedMTU = 576
 // the ladder the vanilla client walks, so a path that drops the largest size
 // falls back to a usable MTU rather than straight to the minimum.
 var mtuSizes = []uint16{maxMTUSize, safeMTUSize, minSupportedMTU}
-
-// provenMTU returns the MTU to commit from a reply granting mtu carried by a
-// datagram of n bytes. A grant above safeMTUSize holds only when the reply
-// filled the granted size, proving the path towards us carries it; otherwise
-// the safe size is committed, which needs no proof.
-func provenMTU(mtu uint16, n int) uint16 {
-	if mtu > safeMTUSize && n < int(mtu)-28 {
-		return safeMTUSize
-	}
-	return mtu
-}
 
 // mtuSizesFor returns the MTU values to probe with when starting a
 // connection. If maxMTU is zero or already at least maxMTUSize, the unmodified
@@ -455,9 +443,9 @@ func (state *connState) discoverMTU() error {
 			if response.MTU > maxMTU {
 				continue
 			}
-			// Commit a safe size while the probe ladder continues. Some protected
-			// servers only accept Request 2 after a smaller Request 1 arrives.
-			state.mtu = provenMTU(response.MTU, n)
+			// Request 2 must echo the advertised grant, even when Reply 1 is
+			// unpadded. Bedrock-compatible servers may require an exact match.
+			state.mtu = response.MTU
 			return nil
 		case message.IDIncompatibleProtocolVersion:
 			response := &message.IncompatibleProtocolVersion{}
@@ -522,11 +510,10 @@ func (state *connState) openConnection(ctx context.Context) error {
 			if pk.ServerGUID == 0 || pk.MTU < minMTUSize || pk.MTU > maxMTU {
 				continue
 			}
-			// A repeated reply carries a fresh cookie, which a server that
-			// rotated one needs us to adopt. Its grant may lower the committed
-			// size, never raise it.
+			// Adopt the repeated reply's cookie and advertised MTU together
+			// so the next Request 2 matches the latest grant.
 			state.serverSecurity, state.cookie = pk.ServerHasSecurity, pk.Cookie
-			state.mtu = min(state.mtu, provenMTU(pk.MTU, n))
+			state.mtu = pk.MTU
 			stopRequests()
 			stopRequests = state.startRequest2(ctx)
 		case message.IDOpenConnectionReply2:
@@ -535,7 +522,7 @@ func (state *connState) openConnection(ctx context.Context) error {
 				return fmt.Errorf("read open connection reply 2: %w", err)
 			}
 			if pk.MTU >= minMTUSize {
-				// A reply may lower the MTU, never raise it past what was proven.
+				// Reply 2 may lower the MTU from the Reply 1 grant.
 				state.mtu = min(state.mtu, pk.MTU)
 			}
 			return nil

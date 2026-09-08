@@ -304,28 +304,6 @@ func TestHandshakeStepsDownWhenReplyDropped(t *testing.T) {
 	}
 }
 
-// TestProvenMTU checks a grant above safeMTUSize only survives when the reply
-// datagram itself was padded to the granted size.
-func TestProvenMTU(t *testing.T) {
-	for _, test := range []struct {
-		mtu  uint16
-		n    int
-		want uint16
-	}{
-		{mtu: maxMTUSize, n: int(maxMTUSize) - 28, want: maxMTUSize},
-		{mtu: maxMTUSize, n: int(maxMTUSize), want: maxMTUSize},
-		{mtu: maxMTUSize, n: 32, want: safeMTUSize},
-		{mtu: 1400, n: 1372, want: 1400},
-		{mtu: 1400, n: 1371, want: safeMTUSize},
-		{mtu: safeMTUSize, n: 32, want: safeMTUSize},
-		{mtu: minSupportedMTU, n: 32, want: minSupportedMTU},
-	} {
-		if got := provenMTU(test.mtu, test.n); got != test.want {
-			t.Fatalf("provenMTU(%v, %v): got %v, want %v", test.mtu, test.n, got, test.want)
-		}
-	}
-}
-
 // TestDiscoverMTUEchoesCompatibilityRequest2 checks the invalid-MTU fallback
 // echoes the challenge value exactly. DDoS protection may require that value
 // even though it is not a usable packet size.
@@ -446,10 +424,9 @@ func (c *stripPaddingConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	return c.PacketConn.WriteTo(b, addr)
 }
 
-// TestHandshakeProbesSafeMTUAfterUnpaddedGrant checks the dialer walks down to
-// a matching Request 1 probe instead of substituting safeMTUSize for a larger,
-// unproven grant. Vanilla servers send these short Request 1 replies.
-func TestHandshakeCommitsSafeMTUAfterUnpaddedGrant(t *testing.T) {
+// TestHandshakeCommitsAdvertisedMTUAfterUnpaddedGrant checks that a short
+// Reply 1 still grants the advertised MTU without waiting for another probe.
+func TestHandshakeCommitsAdvertisedMTUAfterUnpaddedGrant(t *testing.T) {
 	upstream := &stripPaddingListener{}
 	l, err := ListenConfig{UpstreamPacketListener: upstream}.Listen("127.0.0.1:0")
 	if err != nil {
@@ -459,22 +436,20 @@ func TestHandshakeCommitsSafeMTUAfterUnpaddedGrant(t *testing.T) {
 
 	start := time.Now()
 	client, server := dialListener(t, l)
-	if client.mtu != safeMTUSize || server.mtu != safeMTUSize {
-		t.Fatalf("negotiated MTU: client %v, server %v, want %v", client.mtu, server.mtu, safeMTUSize)
+	if client.mtu != maxMTUSize || server.mtu != maxMTUSize {
+		t.Fatalf("negotiated MTU: client %v, server %v, want %v", client.mtu, server.mtu, maxMTUSize)
 	}
-	// Every server in the wild grants unpadded, so walking the rest of the
-	// ladder here would cost a rung on every connection.
+	// A short reply must not delay Request 2 until the next probe.
 	if elapsed := time.Since(start); elapsed > time.Second/4 {
 		t.Fatalf("handshake took %v, want well under the %v probe interval", elapsed, time.Second/2)
 	}
 	if conn := upstream.conn.Load(); conn == nil || conn.safeProbe.Load() {
-		t.Fatal("dialer stepped down a rung instead of committing the safe MTU at once")
+		t.Fatal("dialer stepped down a rung instead of using the advertised MTU")
 	}
 }
 
 // TestOpenConnectionAdoptsCookieFromUnpaddedRepeatedReply checks a server that
-// rotates its cookie is still followed when its reply is unpadded, which every
-// server in the wild is.
+// rotates its cookie and raises its advertised MTU in an unpadded reply.
 func TestOpenConnectionAdoptsCookieFromUnpaddedRepeatedReply(t *testing.T) {
 	server, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -537,8 +512,8 @@ func TestOpenConnectionAdoptsCookieFromUnpaddedRepeatedReply(t *testing.T) {
 	}
 	select {
 	case got := <-adopted:
-		if got.mtu != uint32(safeMTUSize) {
-			t.Fatalf("Request 2 MTU: got %v, want %v", got.mtu, safeMTUSize)
+		if got.mtu != uint32(maxMTUSize) {
+			t.Fatalf("Request 2 MTU: got %v, want %v", got.mtu, maxMTUSize)
 		}
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for a Request 2 carrying the rotated cookie")
@@ -793,4 +768,94 @@ type offlineWriteCounter struct {
 func (c *offlineWriteCounter) Write(b []byte) (int, error) {
 	c.writes.Add(1)
 	return c.Conn.Write(b)
+}
+
+// TestHandshakeEchoesUnpaddedReply1Grant checks the exact sequence used by
+// Bedrock-compatible peers: Request 2 echoes the unpadded Reply 1 grant, and
+// Reply 2 may lower the MTU for the established connection.
+func TestHandshakeEchoesUnpaddedReply1Grant(t *testing.T) {
+	server, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	const advertisedMTU = uint16(1400)
+	requestMTU := make(chan uint16, 1)
+	go func() {
+		b := make([]byte, 2048)
+		replied := false
+		for {
+			n, addr, err := server.ReadFrom(b)
+			if err != nil {
+				return
+			}
+			if n == 0 {
+				continue
+			}
+			switch b[0] {
+			case message.IDOpenConnectionRequest1:
+				if replied {
+					continue
+				}
+				reply, _ := (&message.OpenConnectionReply1{ServerGUID: 1, MTU: advertisedMTU}).MarshalBinary()
+				if _, err := server.WriteTo(reply, addr); err != nil {
+					return
+				}
+				replied = true
+			case message.IDOpenConnectionRequest2:
+				request := &message.OpenConnectionRequest2{}
+				if err := request.UnmarshalBinary(b[1:n]); err != nil {
+					continue
+				}
+				select {
+				case requestMTU <- request.MTU:
+				default:
+				}
+				if request.MTU != advertisedMTU {
+					continue
+				}
+				reply, _ := (&message.OpenConnectionReply2{
+					ServerGUID:    1,
+					ClientAddress: netip.MustParseAddrPort("127.0.0.1:1"),
+					MTU:           safeMTUSize,
+				}).MarshalBinary()
+				_, _ = server.WriteTo(reply, addr)
+				return
+			}
+		}
+	}()
+
+	conn, err := net.Dial("udp", server.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	state := &connState{
+		conn:               conn,
+		raddr:              conn.RemoteAddr(),
+		maxMTU:             maxMTUSize,
+		maxTransientErrors: 10,
+		ticker:             time.NewTicker(time.Second / 2),
+	}
+	defer state.ticker.Stop()
+
+	if err := state.negotiate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-requestMTU:
+		if got != advertisedMTU {
+			t.Fatalf("Request 2 MTU: got %v, want %v", got, advertisedMTU)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for Request 2")
+	}
+	if state.mtu != safeMTUSize {
+		t.Fatalf("final MTU: got %v, want %v", state.mtu, safeMTUSize)
+	}
 }
